@@ -132,7 +132,7 @@ def group_accuracy(correct_arr, group_arr, min_size=10):
     for g, g_count in zip(vals, counts): 
         if g_count > min_size: 
             g_acc = np.mean(correct_arr[group_arr == g])
-            group_dict[race_encoding[g]] = g_acc
+            group_dict[race_encoding[race_grouping[g]]] = g_acc
     # find non-white accuracy
     group_dict["non-white"] = np.mean(correct_arr[group_arr != 1])
     return group_dict
@@ -144,7 +144,7 @@ def group_accuracy_ot(target, pred, thresh, group_arr, min_size=10):
         if g_count > min_size: 
             g_acc = accuracy_score(y_true=target[group_arr == g], 
                                    y_pred=(pred > thresh)[group_arr == g])
-            group_dict[race_encoding[g]] = g_acc
+            group_dict[race_encoding[race_grouping[g]]] = g_acc
     # find non-white accuracy
     group_dict["non-white"] = accuracy_score(y_true=target[group_arr != 1], 
                                    y_pred=(pred > thresh)[group_arr != 1])
@@ -157,7 +157,7 @@ def group_f1(target, pred, group_arr, min_size=10):
         if g_count > min_size: 
             g_f1 = f1_score(target[group_arr == g], 
                                       pred[group_arr == g])
-            group_dict[race_encoding[g]] = g_f1
+            group_dict[race_encoding[race_grouping[g]]] = g_f1
     # find non-white f1
     group_dict["non-white"] = f1_score(target[group_arr != 1], 
                                       pred[group_arr != 1])
@@ -173,7 +173,7 @@ def group_auc(target, pred, group_arr, min_size=10):
                 g_auc = roc_auc_score(target[group_arr == g], 
                                       pred[group_arr == g])
 
-                group_dict[race_encoding[g]] = g_auc
+                group_dict[race_encoding[race_grouping[g]]] = g_auc
     # find all non-white AUC                 
     group_dict["non-white"] =roc_auc_score(target[group_arr != 1], 
                                       pred[group_arr != 1])
@@ -211,7 +211,6 @@ def kl_input(x, pkde, qkde, c):
     px = np.exp(pkde.score_samples(c.transform(x))) + 1e-6
     qx = np.exp(qkde.score_samples(c.transform(x))) + 1e-6
     return sp.kl_div(px, qx).mean()
-
 
 def entropy_input(x, pkde, qkde, c): 
     # include stability term
