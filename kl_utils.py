@@ -19,67 +19,10 @@ import optuna
 import timeit
 import time 
 
-class LogisticRegression(nn.Module):    
+class BaseLogisticRegression:    
     def __init__(self, feature_dim, tol=0.0001, max_iter=400,  eta0=0.01, momentum=0,dampening=0, weight_decay=0, patience = 5):
         super().__init__()
-        self.linear = torch.nn.Linear(feature_dim, 1, dtype=torch.float64)
-        self.tol = tol
-        self.learning_rate = eta0
-        self.patience= patience
-        self.max_iter = max_iter
-        self.momentum = momentum
-        self.dampening = dampening
-        self.weight_decay = weight_decay
-    def forward(self, x):
-        return self.linear(x).sigmoid()
-    
-    def shuffle_data(self, X, y): 
-        permutation = torch.randperm(X.shape[0]) 
-        X, y = X[permutation], y[permutation]
-        return X, y 
-
-    def fit(self, X, y): 
-        criterion = torch.nn.BCELoss()
-        prev_loss = torch.Tensor([float('inf')])
-        patience, learning_rate = self.patience, self.learning_rate
-        optimizer = torch.optim.SGD(self.parameters(), learning_rate, momentum=self.momentum, dampening=self.dampening, weight_decay=self.weight_decay)
-        train_samples =int(X.shape[0] * .9 )
-        X_train, X_val, y_train, y_val = X[:train_samples], X[train_samples:], y[:train_samples], y[train_samples:]
-        for epoch in range(self.max_iter): 
-            optimizer.zero_grad()
-            output = self.forward(X_train)
-            loss = criterion(output.squeeze(), y_train)
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad(): 
-                output = self.forward(X_val)
-                val_loss = criterion(output.squeeze(dim=1), y_val)
-                if (abs(prev_loss - val_loss) < self.tol) or (learning_rate < 1e-6):
-                    break
-                learning_rate, patience = self.adjust_learning_rate(learning_rate, prev_loss, val_loss, patience=patience)
-                prev_loss = val_loss
-                if epoch != 0 and epoch % 10 == 0: 
-                    print(f"epoch {epoch} loss: {val_loss}")
-            X, y = self.shuffle_data(X, y)
-            X_train, X_val, y_train, y_val = X[:train_samples], X[train_samples:], y[:train_samples], y[train_samples:]
-    def adjust_learning_rate(self, lr, prev_loss, curr_loss, factor=5, patience=5):
-        # Decrease learning rate by `factor` if loss doesn't improve after `patience` epochs
-        has_plateaued = self.loss_has_plateaued(prev_loss, curr_loss)
-        if patience == 1 and has_plateaued: 
-            lr = lr/factor 
-            patience = self.patience
-        else: 
-            patience-=1
-        return lr, patience
-
-    def loss_has_plateaued(self, previous_loss, current_loss):
-        return current_loss > previous_loss
-    
-class EncryptedLogisticRegression(crypten.nn.Module):
-    
-    def __init__(self, feature_dim, tol=0.0001, max_iter=400,  eta0=0.0001, momentum=0,dampening=0, weight_decay=0, patience = 5):
-        super().__init__()
-        self.linear = crypten.nn.Linear(feature_dim, 1)
+        self.feature_dim = feature_dim
         self.tol = tol
         self.learning_rate = eta0
         self.patience= patience
@@ -88,70 +31,83 @@ class EncryptedLogisticRegression(crypten.nn.Module):
         self.dampening = dampening
         self.weight_decay = weight_decay
         
+        self.model = self.init_model()
+        self.criterion = self.init_loss()
+        self.optimizer = self.init_optimizer()
+
+    def init_model(self): raise NotImplementedError
+
+    def init_loss(self): raise NotImplementedError
+
+    def init_optimizer(self): raise NotImplementedError
+
+    def to_plain(self, x): return x
+
     def forward(self, x):
-        return self.linear(x).sigmoid()
+        return self.model(x).sigmoid()
     
     def shuffle_data(self, X, y): 
         permutation = torch.randperm(X.shape[0]) 
-        X, y = X[permutation], y[permutation]
-        return X, y 
-    
+        return X[permutation], y[permutation] 
+
     def fit(self, X, y): 
-        criterion = crypten.nn.BCELoss()
-        prev_loss = crypten.cryptensor(torch.Tensor([float('inf')]))
-        patience, learning_rate = self.patience, self.learning_rate
-        optimizer = crypten.optim.SGD(self.parameters(), learning_rate, momentum=self.momentum, dampening=self.dampening, weight_decay=self.weight_decay, grad_threshold=1)
-        train_samples =int(X.shape[0] * .9 )
-        X_train, X_val, y_train, y_val = X[:train_samples], X[train_samples:], y[:train_samples], y[train_samples:]
+        prev_loss = float('inf')
+        patience, lr = self.patience, self.learning_rate
+        split =int(X.shape[0] * .9 )
         for epoch in range(self.max_iter): 
-            optimizer.zero_grad()
-            output = self.forward(X_train)
-            loss = criterion(output.squeeze(), y_train)
+            self.optimizer.zero_grad()
+            output = self.forward(X[:split])
+            loss = self.criterion(output.squeeze(), y[:split])
             loss.backward()
-            optimizer.step()
+            self.optimizer.step()
             with torch.no_grad(): 
-                output = self.forward(X_val)
-                val_loss = criterion(output.squeeze(), y_val)
-                if (prev_loss.sub(val_loss).abs().get_plain_text() < self.tol) or (learning_rate < 1e-6):
+                val_out = self.forward(X[split:])
+                val_loss = self.criterion(val_out.squeeze(), y[split:])
+                val_loss_plain = self.to_plain(val_loss)
+                if (abs(prev_loss - val_loss_plain) < self.tol) or (lr < 1e-6):
                     break
-                learning_rate, patience = self.adjust_learning_rate(learning_rate, prev_loss, val_loss, patience=patience)
-                prev_loss = val_loss
-                if val_loss.get_plain_text() < 0 or val_loss.get_plain_text() > 10: 
-                        print("below zero")
-                        print(val_loss)
+                if val_loss_plain > prev_loss:
+                    patience -= 1
+                    if patience <= 0:
+                        lr /= 5
+                        self.set_lr(lr)
+                        patience = self.patience
+
+                prev_loss = val_loss_plain
+
                 if epoch != 0 and epoch % 10 == 0:
-                    print(f"epoch {epoch} loss: {val_loss.get_plain_text()}")
+                    print(f"epoch {epoch} val loss: {val_loss_plain}")
+
             X, y = self.shuffle_data(X, y)
-            X_train, X_val, y_train, y_val = X[:train_samples], X[train_samples:], y[:train_samples], y[train_samples:]
+    def set_lr(self, lr):
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+    
+class PlaintextLogisticRegression(BaseLogisticRegression, nn.Module):
+    def init_model(self):
+        return torch.nn.Linear(self.feature_dim, 1, dtype=torch.float64)
 
-    def adjust_learning_rate(self, lr, prev_loss, curr_loss, factor=5, patience=5):
-        # Decrease learning rate by `factor` if loss doesn't improve after `patience` epochs
-        has_plateaued = self.loss_has_plateaued(prev_loss, curr_loss)
-        if patience == 1:
-            lr = crypten.where(has_plateaued, lr/factor, lr).get_plain_text()
-            patience= crypten.where(has_plateaued, self.patience, patience).get_plain_text()
-            
-        else: 
-            patience= crypten.where(has_plateaued, patience-1, patience).get_plain_text()
-        return lr, patience
+    def init_loss(self):
+        return torch.nn.BCELoss()
 
-    def loss_has_plateaued(self, previous_loss, current_loss):
-        return current_loss.gt(previous_loss)
+    def init_optimizer(self):
+        return torch.optim.SGD(self.model.parameters(), self.learning_rate, momentum=self.momentum,
+                               dampening=self.dampening, weight_decay=self.weight_decay)
 
+class EncryptedLogisticRegression(BaseLogisticRegression, crypten.nn.Module):
+    
+    def init_model(self):
+        return crypten.nn.Linear(self.feature_dim, 1)
 
-class EncryptedStandardScaler(): 
-    ## (x- mean)/std 
-    def fit(self, x):
-        n_samples = x.shape[0]
-        self.mean = x.mean(dim=0) ## samples, features
-        var = (x.sub(self.mean)).pow(2).sum(dim=0).div(n_samples)
-        self.std = var.sqrt()
+    def init_loss(self):
+        return crypten.nn.BCELoss()
 
-    def transform(self, x):
-        x_p = x.get_plain_text()
-        # NOT WOKRING
-        return crypten.cryptensor(torch.Tensor((x_p.sub(self.mean.get_plain_text())).div(self.std.get_plain_text() + 1e-7)))
-        #return (x.sub(self.mean)).div(self.std.add(1e-7))
+    def init_optimizer(self):
+        return crypten.optim.SGD(self.model.parameters(), self.learning_rate, momentum=self.momentum,
+                                 dampening=self.dampening, weight_decay=self.weight_decay, grad_threshold=1)
+
+    def to_plain(self, x):
+        return x.get_plain_text()
 
 class StandardScaler(): 
     ## (x- mean)/std 
@@ -188,12 +144,21 @@ def get_hospital(hid, data_path, split='train', max_samples=None, sample_ratio=1
 def get_breast_data(id, data_path, split='train',max_samples=None, sample_ratio=1, rand_seed=42):
     file_name = f'{data_path}/bcwd.npz'
     data = np.load(os.path.join(file_name), allow_pickle=True)
-    x = data[split].item()['features']
-    y = data[split].item()['labels']
+    x = data[split].item()['x']
+    y = data[split].item()['y']
     if split == 'train': 
         feat_label = "perturbed" if id != 'orig' else id
         x = x[feat_label]
         y = y[id]
+    xy = np.concatenate((x, y.reshape(-1, 1)), axis=1)
+    return subsample_data(x, y, xy, sample_ratio, max_samples, rand_seed)
+
+def get_folktables_data(id, data_path, split='train',max_samples=None, sample_ratio=1, rand_seed=42):
+    file_name = f'{data_path}/folktables.npz'
+    year = '2014'
+    data = np.load(os.path.join(file_name), allow_pickle=True)
+    x = data[split].item()[id][year]['features']
+    y = data[split].item()[id][year]['labels']
     xy = np.concatenate((x, y.reshape(-1, 1)), axis=1)
     return subsample_data(x, y, xy, sample_ratio, max_samples, rand_seed)
 
@@ -239,7 +204,9 @@ def run_encrypted_pipeline(scaler, model, x1, x2, permutation):
 def get_data(dataset, id, data_path, split='train', max_samples=1500):
     if dataset == 'bcwd': 
         x, y, xy = get_breast_data(id, data_path, split, max_samples)
-    else: 
+    elif dataset == 'folktables':
+        x, y, xy = get_folktables_data(id, data_path, split, max_samples)
+    else:
         x, y, xy = get_hospital(id, data_path, split, max_samples)
     return x, y, xy
 
@@ -261,6 +228,8 @@ def get_ids(dataset):
             for run in range(RUNS):
                 ids.append(f"perturbed_{i}_{run}")
         return ids
+    else: 
+        return ["SD", "NE", "IA", "MN", "OH", "PA", "MI", "TX", "LA", "GA", "FL", "CA", "SC", "WA", "MA"]
 
 def compute_score(dataset: str, data_path: str, save_dir: str, hps: dict, num_samples: int=1000, compute_encrypted=True, debug = False, only_source=None):
     ids = get_ids(dataset) 
@@ -284,13 +253,13 @@ def compute_score(dataset: str, data_path: str, save_dir: str, hps: dict, num_sa
                 x_val, _, xy_val = get_data(dataset,hos, data_path, 'test')
                 scaler = StandardScaler()
                 if not compute_encrypted:
-                    model = LogisticRegression(x.shape[1], max_iter=max_iter, eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
+                    model = PlaintextLogisticRegression(x.shape[1], max_iter=max_iter, eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
                                                         momentum=hps['momentum'], dampening=hps['damp'],
                                                         patience=hps['patience'], tol=hps['tol'])
                     scaler, model = run_pipeline(scaler, model, x, x2, permutation)
                     predictions = get_prediction(model, scaler, torch.from_numpy(x_val).double())
                     results_x[i, test_i] = predictions.mean()
-                    model = LogisticRegression(xy.shape[1], max_iter=max_iter, eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
+                    model = PlaintextLogisticRegression(xy.shape[1], max_iter=max_iter, eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
                                     momentum=hps['momentum'], dampening=hps['damp'],
                                     patience=hps['patience'], tol=hps['tol'])
                     scaler, model = run_pipeline(scaler, model, xy, xy2, permutation)
@@ -325,82 +294,6 @@ def compute_score(dataset: str, data_path: str, save_dir: str, hps: dict, num_sa
         with open(save_dir / 'encrypted-score-x.npy', 'wb') as f:
             np.save(f, encrypted_results_x)
 
-def compute_kl_score(dataset: str, data_path: str, save_dir: str, hps: dict, num_samples: int=1000, encrypt=False):
- 
-    ids = get_ids(dataset)
-    results_x = np.zeros((len(ids), len(ids)))
-    results_xy = np.zeros((len(ids), len(ids)))
-    encrypted_results_x = np.zeros((len(ids), len(ids)))
-    encrypted_results_xy = np.zeros((len(ids), len(ids)))
-    print(f"using {num_samples}")
-    for test_i, test_h in enumerate(ids):
-        for i, h in enumerate(ids):
-            hos = test_h
-            if h != hos:
-                x, y, xy = get_hospital(h, data_path, 'train', max_samples=num_samples)
-                x2, y2, xy2 = get_hospital(hos, data_path, 'train', max_samples=num_samples)
-                permutation = torch.randperm(x.shape[0] + x2.shape[0]) 
-                scaler = StandardScaler()
-                model = LogisticRegression(x.shape[1], max_iter=hps['max_iter'], eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
-                                                    momentum=hps['momentum'], dampening=hps['damp'],
-                                                    patience=hps['patience'], tol=hps['tol'])
-                scaler, model = run_pipeline(scaler, model, x, x2, permutation)
-                predictions = get_prediction(model, scaler, torch.from_numpy(x_val).double())
-                results_x[i, test_i] = predictions.mean()
-
-                model = LogisticRegression(xy.shape[1], max_iter=hps['max_iter'], eta0= hps['eta0'], weight_decay=hps['weight_decay'], 
-                                momentum=hps['momentum'], dampening=hps['damp'],
-                                patience=hps['patience'], tol=hps['tol'])
-                scaler, model = run_pipeline(scaler, model, xy, xy2, permutation)
-                predictions = get_prediction(model, scaler, torch.from_numpy(xy_val).double())
-                results_xy[i, test_i] = predictions.mean()
-
-                X_train = np.concatenate((x, x2), axis=0)
-                Y_train = np.concatenate((np.ones(len(x)), np.zeros(len(x2))), axis=0)
-
-                x_val, _, _ = get_hospital(h, data_path, 'test')
-                r = pipe.predict_proba(x_val)[:, 1]
-                r = np.clip(r, 0.01, 0.99)
-                s = r / (1 - r)
-                results_x[i, test_i] = np.log2(s).mean()    
-
-                X_train = np.concatenate((xy, xy2), axis=0)
-                Y_train = np.concatenate((np.ones(len(xy)), np.zeros(len(xy2))), axis=0)
-
-                
-                _, _, xy_val = get_hospital(h, data_path,  'test')
-                r = pipe.predict_proba(xy_val)[:, 1]
-                r = np.clip(r, 0.01, 0.99)
-                results_xy[i, test_i] = (np.log2(s)).mean()
-
-                ## Encrypted Pipeline
-                encrypted_x1 = crypten.cryptensor(torch.tensor(x))
-                encrypted_x2 = crypten.cryptensor(torch.tensor(x2))
-                scaler, model = run_encrypted_model(encrypted_x1, encrypted_x2)
-                predictions = get_encrypted_prediction(model, scaler, x_val).get_plain_text()
-                s_p =  crypten.cryptensor(1).sub(predictions)
-                r= s.div(s_p) 
-                encrypted_results_x[i, test_i] = r.log().mean().get_plain_text()
-
-                encrypted_xy1 = crypten.cryptensor(torch.tensor(xy))
-                encrypted_xy2 = crypten.cryptensor(torch.tensor(xy2))
-                scaler, model = run_encrypted_model(encrypted_xy1, encrypted_xy2)
-                predictions = get_encrypted_prediction(model, scaler, xy_val)
-                s = predictions.clamp(min=.01, max=.99)
-                s_p =  crypten.cryptensor(1).sub(predictions)
-                r= s.div(s_p) 
-                encrypted_results_xy[i, test_i] = r.log().mean().get_plain_text()
-                # log_p = crypten.cryptensor(t_r.log(), ptype=crypten.mpc.arithmetic)
-                # log_q = crypten.cryptensor((1-t_r).log(), ptype=crypten.mpc.arithmetic)
-    save_dir = Path(save_dir)
-    with open(f"{save_dir}/{dataset}/max_iKL-ratio-xy-true.npy", 'wb') as f:
-        np.save(f, results_xy)
-    with open(save_dir / 'KL-ratio-x-true.npy', 'wb') as f:
-        np.save(f, results_x)
-    with open(save_dir / 'encrypted-KL-ratio-x-true.npy', 'wb') as f:
-        np.save(f, encrypted_results_x)
-    with open(save_dir / 'encrypted-KL-ratio-xy-true.npy', 'wb') as f:
-        np.save(f, encrypted_results_xy)
 
 def objective_hps(trial, data_path, dataset, encrypted=False, only_source=None):
     scores = []
@@ -415,13 +308,14 @@ def objective_hps(trial, data_path, dataset, encrypted=False, only_source=None):
                 tol = trial.suggest_float('tol', .0001, .01, log=True)
                 momentum = trial.suggest_float('momentum', 0.0, 0.99)  
                 weight_decay = trial.suggest_float('weight_decay', 1e-10, 1e-3, log=True)  # L2 regularization (weight decay)
+
                 dampening = trial.suggest_float('damp', 0, .1) 
 
                 x1, _, xy1 = get_data(dataset,test_hospital, data_path, 'train', max_samples=182)
                 x1, _, xy2 = get_data(dataset,other_hospital, data_path, 'train', max_samples=182)
 
                 scaler = StandardScaler()
-                lr = EncryptedLogisticRegression if encrypted else LogisticRegression
+                lr = EncryptedLogisticRegression if encrypted else PlaintextLogisticRegression
 
                 model = lr(xy1.shape[1], tol=tol, max_iter=max_iter,
                                                         dampening=dampening, momentum=momentum,
@@ -465,6 +359,8 @@ def main(my_args=tuple(sys.argv[1:])):
     parser.add_argument('--damp',type=float, default=0.0)
     # Parse the arguments
     args, _ = parser.parse_known_args(my_args)
+
+    ## For perturbation experiments, we only compute scores with source data
     only_source = 'orig' if args.dataset == 'bcwd' else None
     encrypted = True if args.encrypted else False
     if args.hp_search:
@@ -490,20 +386,6 @@ def main(my_args=tuple(sys.argv[1:])):
                       debug=args.debug, only_source=only_source)
         end_time = time.time()
         print(f"Execution Time: {end_time - start_time} secs")
-        # execution_time = timeit.timeit(lambda: compute_score(ids=hospital_ids,
-        #               data_path=args.data_path,
-        #               save_dir=args.output_dir,
-        #               hps=hps,
-        #               num_samples=args.n_samples,
-        #               compute_encrypted=args.encrypted, 
-        #               debug=args.debug), number=100)
-        #print(f"Execution Time for 100 executions: {execution_time} seconds")
-
-    # if args.kl:
-    #     compute_kl_score(hospital_ids=hospital_ids,
-    #                 data_path=args.data_path,
-    #                 save_dir=args.output_dir,
-    #                 num_samples=args.n_samples)
 
 if __name__ == "__main__":
     main()
