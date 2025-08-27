@@ -18,7 +18,6 @@ import optuna
 
 crypten.init()
 torch.manual_seed(42)
-torch.set_num_threads(1)
 
 @dataclass
 class ModelConfig:
@@ -44,21 +43,123 @@ class ExperimentConfig:
     clip_min: float = 0.01
     clip_max: float = 0.99
 
-class BaseLogisticRegression(nn.Module):
+class BaseLogisticRegression:
     """Base class for logistic regression with common functionality"""
     
     def __init__(self, feature_dim: int, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.feature_dim = feature_dim
+        
+    def fit(self, X, y) -> None:
+        """Unified training logic that works for both PyTorch and CrypTen tensors"""
+        criterion = self.create_criterion()
+        prev_loss = self.create_initial_loss()
+        patience, learning_rate = self.config.patience, self.config.eta0
+        optimizer = self.create_optimizer()
+        
+        train_samples = int(X.shape[0] * 0.9)
+        
+        for epoch in range(self.config.max_iter):
+            X, y = self.shuffle_data(X, y)
+            X_train, X_val = X[:train_samples], X[train_samples:]
+            y_train, y_val = y[:train_samples], y[train_samples:]
+
+            optimizer.zero_grad()
+            output = self.forward(X_train)
+            loss = criterion(self.squeeze_output(output), y_train)
+            loss.backward()
+            optimizer.step()
+            
+            with torch.no_grad():
+                output = self.forward(X_val)
+                val_loss = criterion(self.squeeze_output(output), y_val)
+                
+                if self.check_convergence(prev_loss, val_loss) or learning_rate < 1e-6:
+                    break
+                    
+                learning_rate, patience = self.adjust_learning_rate(
+                    learning_rate, prev_loss, val_loss, patience=patience
+                )
+                prev_loss = val_loss
+                
+                if epoch != 0 and epoch % 500 == 0:
+                    self.print_loss(epoch, val_loss)
+                    
+            
+    
+    # Abstract methods to be implemented by subclasses
+    def create_criterion(self):
+        """Create loss criterion"""
+        raise NotImplementedError
+    
+    def create_initial_loss(self):
+        """Create initial loss value"""
+        raise NotImplementedError
+        
+    def create_optimizer(self):
+        """Create optimizer"""
+        raise NotImplementedError
+        
+    def squeeze_output(self, output):
+        """Squeeze output tensor appropriately"""
+        raise NotImplementedError
+        
+    def check_convergence(self, prev_loss, curr_loss) -> bool:
+        """Check convergence condition"""
+        raise NotImplementedError
+        
+    def print_loss(self, epoch: int, loss):
+        """Print loss value"""
+        raise NotImplementedError
+        
+    def shuffle_data(self, X, y):
+        """Shuffle data"""
+        raise NotImplementedError
+        
+    def adjust_learning_rate(self, lr: float, prev_loss, curr_loss, 
+                           factor: int = 5, patience: int = 5) -> Tuple[float, int]:
+        """Adjust learning rate based on loss plateau"""
+        raise NotImplementedError
+
+class LogisticRegression(BaseLogisticRegression, nn.Module):
+    """Plain PyTorch logistic regression implementation"""
+    
+    def __init__(self, feature_dim: int, config: ModelConfig):
+        super().__init__(feature_dim, config)
         self.linear = torch.nn.Linear(feature_dim, 1, dtype=torch.float64)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x).sigmoid()
     
+    def create_criterion(self):
+        return torch.nn.BCELoss()
+    
+    def create_initial_loss(self):
+        return torch.Tensor([float('inf')])
+        
+    def create_optimizer(self):
+        return torch.optim.SGD(
+            self.parameters(), 
+            self.config.eta0, 
+            momentum=self.config.momentum, 
+            dampening=self.config.dampening, 
+            weight_decay=self.config.weight_decay
+        )
+    
+    def squeeze_output(self, output):
+        return output.squeeze()
+        
+    def check_convergence(self, prev_loss, curr_loss) -> bool:
+        return abs(prev_loss - curr_loss) < self.config.tol
+        
+    def print_loss(self, epoch: int, loss):
+        print(f"epoch {epoch} loss: {loss}")
+        
     def shuffle_data(self, X: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         permutation = torch.randperm(X.shape[0])
         return X[permutation], y[permutation]
-    
+        
     def adjust_learning_rate(self, lr: float, prev_loss: torch.Tensor, curr_loss: torch.Tensor, 
                            factor: int = 5, patience: int = 5) -> Tuple[float, int]:
         has_plateaued = self.loss_has_plateaued(prev_loss, curr_loss)
@@ -72,113 +173,49 @@ class BaseLogisticRegression(nn.Module):
     def loss_has_plateaued(self, previous_loss: torch.Tensor, current_loss: torch.Tensor) -> bool:
         return current_loss > previous_loss
 
-class LogisticRegression(BaseLogisticRegression):
-    """Plain PyTorch logistic regression implementation"""
-    
-    def fit(self, X: torch.Tensor, y: torch.Tensor) -> None:
-        criterion = torch.nn.BCELoss()
-        prev_loss = torch.Tensor([float('inf')])
-        patience, learning_rate = self.config.patience, self.config.eta0
-        
-        optimizer = torch.optim.SGD(
-            self.parameters(), 
-            learning_rate, 
-            momentum=self.config.momentum, 
-            dampening=self.config.dampening, 
-            weight_decay=self.config.weight_decay
-        )
-        
-        train_samples = int(X.shape[0] * 0.9)
-        X_train, X_val = X[:train_samples], X[train_samples:]
-        y_train, y_val = y[:train_samples], y[train_samples:]
-        
-        for epoch in range(self.config.max_iter):
-            optimizer.zero_grad()
-            output = self.forward(X_train)
-            loss = criterion(output.squeeze(), y_train)
-            loss.backward()
-            optimizer.step()
-            
-            with torch.no_grad():
-                output = self.forward(X_val)
-                val_loss = criterion(output.squeeze(dim=1), y_val)
-                
-                if abs(prev_loss - val_loss) < self.config.tol or learning_rate < 1e-6:
-                    break
-                    
-                learning_rate, patience = self.adjust_learning_rate(
-                    learning_rate, prev_loss, val_loss, patience=patience
-                )
-                prev_loss = val_loss
-                
-                if epoch != 0 and epoch % 500 == 0:
-                    print(f"epoch {epoch} loss: {val_loss}")
-                    
-            X, y = self.shuffle_data(X, y)
-            X_train, X_val = X[:train_samples], X[train_samples:]
-            y_train, y_val = y[:train_samples], y[train_samples:]
-
-class EncryptedLogisticRegression(crypten.nn.Module):
+class EncryptedLogisticRegression(BaseLogisticRegression, crypten.nn.Module):
     """Encrypted logistic regression using CrypTen"""
     
     def __init__(self, feature_dim: int, config: ModelConfig):
-        super().__init__()
-        self.config = config
+        # Initialize BaseLogisticRegression first (doesn't call super().__init__())
+        BaseLogisticRegression.__init__(self, feature_dim, config)
+        # Initialize crypten.nn.Module
+        crypten.nn.Module.__init__(self)
         self.linear = crypten.nn.Linear(feature_dim, 1)
         
     def forward(self, x: CrypTensor) -> CrypTensor:
         return self.linear(x).sigmoid()
     
+    def create_criterion(self):
+        return crypten.nn.BCELoss()
+    
+    def create_initial_loss(self):
+        return crypten.cryptensor(torch.Tensor([float('inf')]))
+        
+    def create_optimizer(self):
+        return crypten.optim.SGD(
+            self.parameters(), 
+            self.config.eta0, 
+            momentum=self.config.momentum, 
+            dampening=self.config.dampening, 
+            weight_decay=self.config.weight_decay
+        )
+    
+    def squeeze_output(self, output):
+        return output.squeeze()
+        
+    def check_convergence(self, prev_loss, curr_loss) -> bool:
+        return prev_loss.sub(curr_loss).abs().get_plain_text() < self.config.tol
+        
+    def print_loss(self, epoch: int, loss):
+        print(f"epoch {epoch} loss: {loss.get_plain_text()}")
+        
     def shuffle_data(self, X: CrypTensor, y: CrypTensor) -> Tuple[CrypTensor, CrypTensor]:
         permutation = torch.randperm(X.shape[0])
         X_shuffled = X.index_select(0, permutation)
         y_shuffled = y.index_select(0, permutation)
         return X_shuffled, y_shuffled
-    
-    def fit(self, X: CrypTensor, y: CrypTensor) -> None:
-        criterion = crypten.nn.BCELoss()
-        prev_loss = crypten.cryptensor(torch.Tensor([float('inf')]))
-        patience, learning_rate = self.config.patience, self.config.eta0
         
-        optimizer = crypten.optim.SGD(
-            self.parameters(), 
-            learning_rate, 
-            momentum=self.config.momentum, 
-            dampening=self.config.dampening, 
-            weight_decay=self.config.weight_decay
-        )
-        
-        train_samples = int(X.shape[0] * 0.9)
-        X_train, X_val = X[:train_samples], X[train_samples:]
-        y_train, y_val = y[:train_samples], y[train_samples:]
-        
-        for epoch in range(self.config.max_iter):
-            optimizer.zero_grad()
-            output = self.forward(X_train)
-            loss = criterion(output.squeeze(), y_train)
-            loss.backward()
-            optimizer.step()
-            
-            with torch.no_grad():
-                output = self.forward(X_val)
-                val_loss = criterion(output.squeeze(), y_val)
-                
-                if (prev_loss.sub(val_loss).abs().get_plain_text() < self.config.tol 
-                    or learning_rate < 1e-6):
-                    break
-                    
-                learning_rate, patience = self.adjust_learning_rate(
-                    learning_rate, prev_loss, val_loss, patience=patience
-                )
-                prev_loss = val_loss
-                
-                if epoch != 0 and epoch % 500 == 0:
-                    print(f"epoch {epoch} loss: {val_loss.get_plain_text()}")
-                    
-            X, y = self.shuffle_data(X, y)
-            X_train, X_val = X[:train_samples], X[train_samples:]
-            y_train, y_val = y[:train_samples], y[train_samples:]
-    
     def adjust_learning_rate(self, lr: float, prev_loss: CrypTensor, curr_loss: CrypTensor, 
                            factor: int = 5, patience: int = 5) -> Tuple[float, int]:
         has_plateaued = self.loss_has_plateaued(prev_loss, curr_loss)
@@ -359,9 +396,9 @@ class ModelTrainer:
             scaled_features = scaler.transform(features_tensor)
             predictions = model(scaled_features).detach().numpy()
         
-        return np.clip(predictions, 0.0, 1.0)
+        return predictions#np.clip(predictions, 0.0, 1.0)
 
-class ScoreComputer:
+class Scorer:
     """Computes pairwise scores between hospitals"""
     
     def __init__(self, config: ExperimentConfig):
@@ -580,14 +617,14 @@ def main(my_args=tuple(sys.argv[1:])):
     
     # Score computation
     if args.score:
-        score_computer = ScoreComputer(exp_config)
-        score_computer._debug = args.debug  # Set debug flag
+        scorer = Scorer(exp_config)
+        scorer._debug = args.debug  # Set debug flag
         
-        results_x, results_xy = score_computer.compute_pairwise_scores(
+        results_x, results_xy = scorer.compute_pairwise_scores(
             hospital_ids, model_config, args.encrypted, args.debug
         )
         
-        score_computer.save_results(results_x, results_xy, model_config, args.encrypted)
+        scorer.save_results(results_x, results_xy, model_config, args.encrypted)
         print("Score computation completed and saved")
     
 
