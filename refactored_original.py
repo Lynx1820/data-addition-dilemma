@@ -15,9 +15,18 @@ from jaxtyping import Int, Float
 from dataclasses import dataclass
 from typing import Tuple, Optional, Union, List
 import optuna
+import scipy.stats as sp
+
+# Try to import folktables
+try:
+    from folktables import ACSDataSource, ACSEmployment, ACSIncome
+    FOLKTABLES_AVAILABLE = True
+except ImportError:
+    FOLKTABLES_AVAILABLE = False
+    print("Warning: folktables not available. Install with: pip install folktables")
 
 crypten.init()
-torch.manual_seed(42)
+# Note: Seeds will be set inside main() function based on config
 
 @dataclass
 class ModelConfig:
@@ -29,6 +38,7 @@ class ModelConfig:
     momentum: float = 0.0
     weight_decay: float = 0.0
     dampening: float = 0.0
+    seed: int = 42
 
 @dataclass
 class ExperimentConfig:
@@ -42,6 +52,11 @@ class ExperimentConfig:
     numerical_eps: float = 1e-7
     clip_min: float = 0.01
     clip_max: float = 0.99
+    seed: int = 42
+    dataset_type: str = "hospital"  # "hospital" or "folktables"
+    folktables_task: str = "ACSIncome"  # "ACSIncome" or "ACSEmployment"
+    folktables_year: int = 2014
+    folktables_states: List[str] = None
 
 class BaseLogisticRegression:
     """Base class for logistic regression with common functionality"""
@@ -53,10 +68,14 @@ class BaseLogisticRegression:
         
     def fit(self, X, y) -> None:
         """Unified training logic that works for both PyTorch and CrypTen tensors"""
+        # Set seed for reproducibility
+        torch.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        
         criterion = self.create_criterion()
         prev_loss = self.create_initial_loss()
         patience, learning_rate = self.config.patience, self.config.eta0
-        optimizer = self.create_optimizer()
+        self.optimizer = self.create_optimizer()
         
         train_samples = int(X.shape[0] * 0.9)
         
@@ -65,11 +84,11 @@ class BaseLogisticRegression:
             X_train, X_val = X[:train_samples], X[train_samples:]
             y_train, y_val = y[:train_samples], y[train_samples:]
 
-            optimizer.zero_grad()
+            self.optimizer.zero_grad()
             output = self.forward(X_train)
             loss = criterion(self.squeeze_output(output), y_train)
             loss.backward()
-            optimizer.step()
+            self.optimizer.step()
             
             with torch.no_grad():
                 output = self.forward(X_val)
@@ -81,6 +100,9 @@ class BaseLogisticRegression:
                 learning_rate, patience = self.adjust_learning_rate(
                     learning_rate, prev_loss, val_loss, patience=patience
                 )
+                # Update optimizer's learning rate
+                self.set_lr(learning_rate)
+                
                 prev_loss = val_loss
                 
                 if epoch != 0 and epoch % 500 == 0:
@@ -121,6 +143,10 @@ class BaseLogisticRegression:
                            factor: int = 5, patience: int = 5) -> Tuple[float, int]:
         """Adjust learning rate based on loss plateau"""
         raise NotImplementedError
+    def set_lr(self, lr):
+        """Set learning rate for the optimizer"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
 
 class LogisticRegression(BaseLogisticRegression, nn.Module):
     """Plain PyTorch logistic regression implementation"""
@@ -157,6 +183,7 @@ class LogisticRegression(BaseLogisticRegression, nn.Module):
         print(f"epoch {epoch} loss: {loss}")
         
     def shuffle_data(self, X: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(self.config.seed)
         permutation = torch.randperm(X.shape[0])
         return X[permutation], y[permutation]
         
@@ -211,6 +238,7 @@ class EncryptedLogisticRegression(BaseLogisticRegression, crypten.nn.Module):
         print(f"epoch {epoch} loss: {loss.get_plain_text()}")
         
     def shuffle_data(self, X: CrypTensor, y: CrypTensor) -> Tuple[CrypTensor, CrypTensor]:
+        torch.manual_seed(self.config.seed)
         permutation = torch.randperm(X.shape[0])
         X_shuffled = X.index_select(0, permutation)
         y_shuffled = y.index_select(0, permutation)
@@ -316,6 +344,63 @@ class DataLoader:
             
         df = pd.read_csv(self.config.hospital_file, header=None)
         return df[0].values[:self.config.n_hospitals].tolist()
+    
+    def get_folktables_data(self, state: str, split: str = 'train',
+                           max_samples: Optional[int] = None,
+                           sample_ratio: float = 1.0,
+                           rand_seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load folktables data for a specific state"""
+        if not FOLKTABLES_AVAILABLE:
+            raise ImportError("folktables library is not available")
+        
+        # Set seed for reproducibility
+        np.random.seed(rand_seed)
+        
+        # Initialize data source
+        data_source = ACSDataSource(survey_year=str(self.config.folktables_year),
+                                  horizon='1-Year', survey='person')
+        
+        # Get task (ACSIncome or ACSEmployment)
+        if self.config.folktables_task == "ACSIncome":
+            task = ACSIncome
+        elif self.config.folktables_task == "ACSEmployment":
+            task = ACSEmployment
+        else:
+            raise ValueError(f"Unknown folktables task: {self.config.folktables_task}")
+        
+        # Load data for the state
+        acs_data = data_source.get_data(states=[state], download=True)
+        features, labels, groups = task.df_to_numpy(acs_data)
+        
+        # Split train/test (80/20 split)
+        total_samples = len(features)
+        train_size = int(0.8 * total_samples)
+        
+        if split == 'train':
+            x = features[:train_size]
+            y = labels[:train_size]
+        else:  # test
+            x = features[train_size:]
+            y = labels[train_size:]
+        
+        # Create xy (features + labels)
+        xy = np.concatenate((x, y.reshape(-1, 1)), axis=1)
+        
+        # Apply sampling if needed
+        if sample_ratio < 1:
+            x, y, xy = self._sample_data(x, y, xy, sample_ratio, rand_seed)
+        elif max_samples is not None and len(x) > max_samples:
+            x, y, xy = self._sample_data(x, y, xy, max_samples/len(x), rand_seed)
+        
+        return x, y, xy
+    
+    def get_folktables_states(self) -> List[str]:
+        """Get list of available states for folktables"""
+        if self.config.folktables_states is not None:
+            return self.config.folktables_states
+        
+        # Default states from the notebook (states with sufficient samples)
+        return ["SD", "NE", "IA", "MN", "OH", "PA", "MI", "TX", "LA", "GA", "FL", "CA", "SC", "WA", "MA"]
 
 class ModelFactory:
     """Factory for creating models and scalers"""
@@ -352,6 +437,10 @@ class ModelTrainer:
     
     def _train_plain_model(self, model, scaler, features1: np.ndarray, features2: np.ndarray):
         """Train plain PyTorch model"""
+        # Set seed for reproducibility
+        torch.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        
         fea1_tensor = torch.tensor(features1)
         fea2_tensor = torch.tensor(features2)
         
@@ -360,6 +449,7 @@ class ModelTrainer:
             np.concatenate((np.ones(len(features1)), np.zeros(len(features2))), axis=0)
         ).double()
         
+        # Shuffle with seed
         permutation = torch.randperm(len(X_train))
         X_train, Y_train = X_train[permutation], Y_train[permutation]
         
@@ -371,6 +461,10 @@ class ModelTrainer:
     
     def _train_encrypted_model(self, model, scaler, features1: np.ndarray, features2: np.ndarray):
         """Train encrypted CrypTen model"""
+        # Set seed for reproducibility
+        torch.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        
         encrypted_fea1 = crypten.cryptensor(torch.tensor(features1))
         encrypted_fea2 = crypten.cryptensor(torch.tensor(features2))
         
@@ -396,39 +490,87 @@ class ModelTrainer:
             scaled_features = scaler.transform(features_tensor)
             predictions = model(scaled_features).detach().numpy()
         
-        return predictions#np.clip(predictions, 0.0, 1.0)
+        return np.clip(predictions, 0.0, 1.0)
+
+class DivergenceCalculator:
+    """Calculates divergence measures between distributions"""
+    
+    @staticmethod
+    def kl_divergence(pd: np.ndarray, qd: np.ndarray) -> float:
+        """Calculate KL divergence between two log probability distributions
+        
+        Args:
+            pd: log probabilities for distribution P
+            qd: log probabilities for distribution Q
+            
+        Returns:
+            KL divergence D(P||Q)
+        """
+        px = np.exp(pd) + 1e-6
+        qx = np.exp(qd) + 1e-6
+        return sp.entropy(px, qx)
+    
+    @staticmethod
+    def private_kl_divergence(pd: torch.Tensor, qd: torch.Tensor) -> torch.Tensor:
+        """Calculate encrypted KL divergence between two log probability distributions
+        
+        Args:
+            pd: encrypted log probabilities for distribution P
+            qd: encrypted log probabilities for distribution Q
+            
+        Returns:
+            Encrypted KL divergence D(P||Q)
+        """
+        px = pd.exp().add(torch.tensor(1e-6))
+        qx = qd.exp().add(torch.tensor(1e-6))
+        px = px.div(px.sum())  # normalize
+        qx = qx.div(qx.sum())
+        return (px.mul(px.log() - qx.log())).sum()
+    
+    @staticmethod
+    def encode_density(q: np.ndarray):
+        """Encode density for encrypted computation"""
+        return crypten.cryptensor(torch.tensor(q))
 
 class Scorer:
-    """Computes pairwise scores between hospitals"""
+    """Computes pairwise scores between hospitals or states"""
     
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self.data_loader = DataLoader(config)
         self.trainer = ModelTrainer(config)
+        self.divergence_calc = DivergenceCalculator()
     
-    def compute_pairwise_scores(self, hospital_ids: List[int], model_config: ModelConfig, 
+    def compute_pairwise_scores(self, entity_ids, model_config: ModelConfig, 
                               encrypted: bool = False, debug: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute pairwise scores between hospitals"""
-        n_hospitals = len(hospital_ids)
-        results_x = np.zeros((n_hospitals, n_hospitals))
-        results_xy = np.zeros((n_hospitals, n_hospitals))
+        """Compute pairwise scores between entities (hospitals or states)"""
+        n_entities = len(entity_ids)
+        results_x = np.zeros((n_entities, n_entities))
+        results_xy = np.zeros((n_entities, n_entities))
         
         if debug:
-            hospital_ids = hospital_ids[:2]
+            entity_ids = entity_ids[:2]
             
-        for test_i, test_hos in enumerate(hospital_ids):
-            for i, hos in enumerate(hospital_ids):
-                if hos != test_hos:
-                    # Load training data
-                    x, _, xy = self.data_loader.get_hospital_data(
-                        hos, 'train', max_samples=self.config.n_samples
-                    )
-                    x2, _, xy2 = self.data_loader.get_hospital_data(
-                        test_hos, 'train', max_samples=self.config.n_samples
-                    )
-                    
-                    # Load test data
-                    x_val, _, xy_val = self.data_loader.get_hospital_data(hos, 'test')
+        for test_i, test_entity in enumerate(entity_ids):
+            for i, entity in enumerate(entity_ids):
+                if entity != test_entity:
+                    # Load training data based on dataset type
+                    if self.config.dataset_type == "hospital":
+                        x, _, xy = self.data_loader.get_hospital_data(
+                            entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x2, _, xy2 = self.data_loader.get_hospital_data(
+                            test_entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x_val, _, xy_val = self.data_loader.get_hospital_data(entity, 'test')
+                    else:  # folktables
+                        x, _, xy = self.data_loader.get_folktables_data(
+                            entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x2, _, xy2 = self.data_loader.get_folktables_data(
+                            test_entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x_val, _, xy_val = self.data_loader.get_folktables_data(entity, 'test')
                     
                     # Train and evaluate X model
                     x_model = ModelFactory.create_model(x.shape[1], model_config, encrypted)
@@ -446,12 +588,97 @@ class Scorer:
         
         return results_x, results_xy
     
+    def compute_divergence_scores(self, entity_ids, model_config: ModelConfig,
+                                encrypted: bool = False, debug: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute pairwise KL divergence scores between entities"""
+        n_entities = len(entity_ids)
+        kl_results_x = np.zeros((n_entities, n_entities))
+        kl_results_xy = np.zeros((n_entities, n_entities))
+        
+        if debug:
+            entity_ids = entity_ids[:2]
+        
+        for test_i, test_entity in enumerate(entity_ids):
+            for i, entity in enumerate(entity_ids):
+                if entity != test_entity:
+                    # Load data
+                    if self.config.dataset_type == "hospital":
+                        x1, _, xy1 = self.data_loader.get_hospital_data(
+                            entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x2, _, xy2 = self.data_loader.get_hospital_data(
+                            test_entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x_val, _, xy_val = self.data_loader.get_hospital_data(entity, 'test')
+                    else:  # folktables
+                        x1, _, xy1 = self.data_loader.get_folktables_data(
+                            entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x2, _, xy2 = self.data_loader.get_folktables_data(
+                            test_entity, 'train', max_samples=self.config.n_samples
+                        )
+                        x_val, _, xy_val = self.data_loader.get_folktables_data(entity, 'test')
+                    
+                    # Train discriminator models
+                    x_model = ModelFactory.create_model(x1.shape[1], model_config, encrypted)
+                    x_scaler = ModelFactory.create_scaler(encrypted)
+                    x_scaler, x_model = self.trainer.train_model(x_model, x_scaler, x1, x2, encrypted)
+                    
+                    xy_model = ModelFactory.create_model(xy1.shape[1], model_config, encrypted)
+                    xy_scaler = ModelFactory.create_scaler(encrypted)
+                    xy_scaler, xy_model = self.trainer.train_model(xy_model, xy_scaler, xy1, xy2, encrypted)
+                    
+                    # Get log predictions (densities)
+                    if encrypted:
+                        x_logits = x_model(x_scaler.transform(
+                            crypten.cryptensor(torch.tensor(x_val))
+                        )).get_plain_text().numpy()
+                        xy_logits = xy_model(xy_scaler.transform(
+                            crypten.cryptensor(torch.tensor(xy_val))
+                        )).get_plain_text().numpy()
+                        
+                        # Calculate encrypted KL divergence
+                        x_logits_enc = crypten.cryptensor(torch.tensor(x_logits))
+                        xy_logits_enc = crypten.cryptensor(torch.tensor(xy_logits))
+                        
+                        kl_x = self.divergence_calc.private_kl_divergence(
+                            x_logits_enc, x_logits_enc
+                        ).get_plain_text().item()
+                        kl_xy = self.divergence_calc.private_kl_divergence(
+                            xy_logits_enc, xy_logits_enc
+                        ).get_plain_text().item()
+                    else:
+                        x_logits = x_model(x_scaler.transform(
+                            torch.from_numpy(x_val).double()
+                        )).detach().numpy()
+                        xy_logits = xy_model(xy_scaler.transform(
+                            torch.from_numpy(xy_val).double()
+                        )).detach().numpy()
+                        
+                        # Convert to log probabilities
+                        x_log_probs = np.log(np.clip(x_logits, 1e-10, 1-1e-10))
+                        xy_log_probs = np.log(np.clip(xy_logits, 1e-10, 1-1e-10))
+                        
+                        # Calculate KL divergence
+                        kl_x = self.divergence_calc.kl_divergence(x_log_probs, x_log_probs)
+                        kl_xy = self.divergence_calc.kl_divergence(xy_log_probs, xy_log_probs)
+                    
+                    kl_results_x[i, test_i] = kl_x
+                    kl_results_xy[i, test_i] = kl_xy
+        
+        return kl_results_x, kl_results_xy
+    
     def save_results(self, results_x: np.ndarray, results_xy: np.ndarray, 
-                    model_config: ModelConfig, encrypted: bool = False) -> None:
+                    model_config: ModelConfig, encrypted: bool = False, 
+                    result_type: str = "score") -> None:
         """Save results to files"""
         max_iter = 50 if hasattr(self, '_debug') and self._debug else model_config.max_iter
         
-        path = (f"{self.config.output_dir}/max_it{max_iter}_eta0{model_config.eta0}_"
+        dataset_prefix = f"{self.config.dataset_type}_"
+        if self.config.dataset_type == "folktables":
+            dataset_prefix += f"{self.config.folktables_task}_"
+        
+        path = (f"{self.config.output_dir}/{dataset_prefix}max_it{max_iter}_eta0{model_config.eta0}_"
                 f"alpha{model_config.weight_decay}_tol{model_config.tol}_"
                 f"pat{model_config.patience}_mom{model_config.momentum}_"
                 f"damp{model_config.dampening}_n{self.config.n_samples}")
@@ -461,9 +688,9 @@ class Scorer:
         
         prefix = "encrypted-" if encrypted else ""
         
-        with open(save_dir / f'{prefix}score-x.npy', 'wb') as f:
+        with open(save_dir / f'{prefix}{result_type}-x.npy', 'wb') as f:
             np.save(f, results_x)
-        with open(save_dir / f'{prefix}score-xy.npy', 'wb') as f:
+        with open(save_dir / f'{prefix}{result_type}-xy.npy', 'wb') as f:
             np.save(f, results_xy)
 
 class HyperparameterOptimizer:
@@ -526,10 +753,10 @@ class HyperparameterOptimizer:
             for other_hospital in ids:
                 if other_hospital != test_hospital:
                     # Load data
-                    xy1, _, _ = self.data_loader.get_hospital_data(
+                    x1, _, xy1 = self.data_loader.get_hospital_data(
                         test_hospital, 'train', max_samples=1500
                     )
-                    xy2, _, _ = self.data_loader.get_hospital_data(
+                    x2, _, xy2 = self.data_loader.get_hospital_data(
                         other_hospital, 'train', max_samples=1500
                     )
                     
@@ -581,6 +808,16 @@ def main(my_args=tuple(sys.argv[1:])):
     parser.add_argument('--momentum', type=float, default=0.0, help='Momentum')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     parser.add_argument('--damp', type=float, default=0.0, help='Dampening')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    
+    # Dataset configuration
+    parser.add_argument('--dataset', type=str, default='hospital', 
+                       choices=['hospital', 'folktables'], help='Dataset type to use')
+    parser.add_argument('--folktables_task', type=str, default='ACSIncome',
+                       choices=['ACSIncome', 'ACSEmployment'], help='Folktables task')
+    parser.add_argument('--folktables_year', type=int, default=2014, help='Folktables year')
+    parser.add_argument('--kl_divergence', action='store_true', default=False, 
+                       help='Compute KL divergence instead of basic scores')
     
     args, _ = parser.parse_known_args(my_args)
     
@@ -588,7 +825,10 @@ def main(my_args=tuple(sys.argv[1:])):
     exp_config = ExperimentConfig(
         data_path=args.data_path,
         output_dir=args.output_dir,
-        n_samples=args.n_samples
+        n_samples=args.n_samples,
+        dataset_type=args.dataset,
+        folktables_task=args.folktables_task,
+        folktables_year=args.folktables_year
     )
     
     model_config = ModelConfig(
@@ -598,21 +838,40 @@ def main(my_args=tuple(sys.argv[1:])):
         tol=args.tol,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
-        dampening=args.damp
+        dampening=args.damp,
+        seed=args.seed
     )
+    
+    exp_config.seed = args.seed
+    
+    # Set global seeds for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     
     # Initialize components
     data_loader = DataLoader(exp_config)
-    hospital_ids = data_loader.get_hospital_ids()
     
-    print(f"Working with {len(hospital_ids)} hospitals")
+    # Get entity IDs based on dataset type
+    if exp_config.dataset_type == "hospital":
+        entity_ids = data_loader.get_hospital_ids()
+        entity_name = "hospitals"
+    else:  # folktables
+        if not FOLKTABLES_AVAILABLE:
+            raise ImportError("folktables library is required for folktables dataset. Install with: pip install folktables")
+        entity_ids = data_loader.get_folktables_states()
+        entity_name = "states"
+    
+    print(f"Working with {len(entity_ids)} {entity_name}")
     print(f"Using {'encrypted' if args.encrypted else 'plaintext'} computation")
+    print(f"Dataset: {exp_config.dataset_type}")
+    if exp_config.dataset_type == "folktables":
+        print(f"Task: {exp_config.folktables_task}, Year: {exp_config.folktables_year}")
     
     # Hyperparameter optimization
     if args.hp_search:
         optimizer = HyperparameterOptimizer(exp_config)
-        n_trials = 100 if args.encrypted else 10
-        model_config = optimizer.optimize(hospital_ids, n_trials, args.encrypted)
+        n_trials = 100 if args.encrypted else 500
+        model_config = optimizer.optimize(entity_ids, n_trials, args.encrypted)
         print(f"Best hyperparameters found: {model_config}")
     
     # Score computation
@@ -620,12 +879,20 @@ def main(my_args=tuple(sys.argv[1:])):
         scorer = Scorer(exp_config)
         scorer._debug = args.debug  # Set debug flag
         
-        results_x, results_xy = scorer.compute_pairwise_scores(
-            hospital_ids, model_config, args.encrypted, args.debug
-        )
-        
-        scorer.save_results(results_x, results_xy, model_config, args.encrypted)
-        print("Score computation completed and saved")
+        if args.kl_divergence:
+            # Compute KL divergence scores
+            results_x, results_xy = scorer.compute_divergence_scores(
+                entity_ids, model_config, args.encrypted, args.debug
+            )
+            scorer.save_results(results_x, results_xy, model_config, args.encrypted, "kl_divergence")
+            print("KL divergence computation completed and saved")
+        else:
+            # Compute regular scores
+            results_x, results_xy = scorer.compute_pairwise_scores(
+                entity_ids, model_config, args.encrypted, args.debug
+            )
+            scorer.save_results(results_x, results_xy, model_config, args.encrypted, "score")
+            print("Score computation completed and saved")
     
 
 if __name__ == "__main__":
